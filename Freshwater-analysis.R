@@ -35,6 +35,6 @@ metrics <- metrics %>%
   mutate(metrics$REPLICATE_CODE<- as.factor(metrics$REPLICATE_CODE))          # Convert back to factor
 unique(metrics$REPLICATE_CODE)
 
-#create the model
+#create the dummy model
 mymod<- lmer(COUNT_OF_SAMPLES ~ ALKALINITY +(1|REPORTING_AREA)+(1|BASE_DATA_DATE)+ WIDTH + DEPTH, data=site2)
 summary (mymod)
