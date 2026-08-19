@@ -4,13 +4,13 @@ graphics.off()
 
 #Load in or install the necessary packages 
 packages <- c("lme4", "tidyverse", "lubridate", "foreign", "data.table",
-              "hutilscpp", "sf", "RANN", "geosphere", 'DHARMa', 'ggeffects','patchwork')
+               "sf", "RANN", "geosphere", 'DHARMa', 'ggeffects','patchwork','lmerTest')
 
-# Install any that aren't already installed
+#Install any that aren't already installed
 missing <- packages[!packages %in% installed.packages()[, "Package"]]
 if (length(missing)) install.packages(missing)
 
-# Load them all
+#Load them all and remove the items from the library
 invisible(lapply(packages, library, character.only = TRUE))
 remove('missing', 'packages')
 
@@ -21,7 +21,7 @@ taxoninfo <- read.csv('data/Taxa/OPEN_DATA_TAXON_INFO.csv', header=T, sep = ',')
 metrics<- read.csv('data/Taxa/INV_OPEN_DATA_METRICS.csv', header=T, sep=',')
 
 #Create a secondary site dataframe to not mess with the original with only columns 
-#That have more than 10,000 entries (as the data set is
+#that have more than 10,000 entries (as the data set is
 #30453, set the N/A threshold to 0.3)
 combined = site[,!sapply(site, function(x) mean(is.na(x)))>0.7]
 
@@ -42,6 +42,7 @@ taxacopy$BMWP_N_TAXA<- metrics$BMWP_N_TAXA[match(taxacopy$SAMPLE_ID,metrics$SAMP
 taxacopy$BMWP_ASPT<- metrics$BMWP_ASPT[match(taxacopy$SAMPLE_ID,metrics$SAMPLE_ID)]
 taxacopy$WHPT_N_TAXA<- metrics$WHPT_N_TAXA[match(taxacopy$SAMPLE_ID,metrics$SAMPLE_ID)]
 taxacopy$WHPT_ASPT<- metrics$WHPT_ASPT[match(taxacopy$SAMPLE_ID,metrics$SAMPLE_ID)]
+taxacopy$SAMPLE_METHOD_DESCRIPTION<- metrics$SAMPLE_METHOD_DESCRIPTION[match(taxacopy$SAMPLE_ID,metrics$SAMPLE_ID)]
 taxacopy$EASTING<- combined$EASTING[match(taxacopy$SITE_ID,combined$SITE_ID)]
 taxacopy$NORTHING<- combined$NORTHING[match(taxacopy$SITE_ID,combined$SITE_ID)]
 taxacopy$NGR_PREFIX<- combined$NGR_PREFIX[match(taxacopy$SITE_ID,combined$SITE_ID)]
@@ -80,36 +81,16 @@ tempdata <- map_dfc(tempfiles, readfun)
 #Remove the first letter so that each column can be matched with the ID in 'segments'
 tempdata<- rename_with(tempdata,~ substring(., 2))
 
-#Convert the easting and northing to longitude and latitude
-#df2<- combinedriver 
-#df2_coords<- df2 %>%
- # st_as_sf(coords = c("EASTING", "NORTHING"), crs = 27700) %>%
-  #st_transform(4326) %>%
-  #st_coordinates() %>%
-  #as.data.frame()
-
-#combinedriver$LAT = df2_coords$Y
-#combinedriver$LON = df2_coords$X
-
-# Match the coordinates using the hutilscpp package
-#temp_coords<- as.data.frame(subset(segments, select = c(FNODE_LAT, FNODE_LON)))%>%
-#st_as_sf(coords = c("FNODE_LON", "FNODE_LAT"), crs = 4326)
-
-#df2_coords <- st_as_sf(df2_coord)%>%
-#st_transform(4326)
-
-
-
-##Claude method
+##Round the coordinates 
 segments$FNODE_LON<- round(segments$FNODE_LON, 6)
 segments$FNODE_LAT<- round(segments$FNODE_LAT, 6)
 
 #Function creation: letter -> 0-based index (A=0)
 utf8ToInt2 <- function(ch) utf8ToInt(ch) - utf8ToInt("A")
 
-#Convert a 2-letter NGR prefix to its full BNG easting/northing offset
+#Convert the 2-letter NGR prefix to its full BNG easting/northing offset
 
-#Vectorised NGR prefix -> full BNG offset
+#Use the vectorised NGR prefix to get the full BNG offset
 ngr_offset <- function(prefix) {
   prefix <- toupper(trimws(prefix))
   # 0-based letter index via alphabet lookup (vectorised)
@@ -123,10 +104,7 @@ ngr_offset <- function(prefix) {
   data.frame(e_off = e100 * 100000, n_off = n100 * 100000)
 }
 
-#Sanity check
-ngr_offset(c("SV", "SX", "TQ", "SO"))
-
-#finish off the easting and northing prefixes
+#Finish off the easting and northing prefixes
 off <- ngr_offset(combinedriver$NGR_PREFIX)
 
 combinedriver$FULL_EASTING  <- off$e_off + combinedriver$EASTING
@@ -155,6 +133,7 @@ combinedriver <- st_drop_geometry(pts_wgs)
 combinedriver$LON <- coords[, "X"]
 combinedriver$LAT <- coords[, "Y"]
 
+#Check the ranges so that they in theory match
 range(combinedriver$FULL_EASTING)   # expect ~80,000–660,000
 range(combinedriver$FULL_NORTHING)  # expect ~0–660,000
 range(combinedriver$LAT)            # expect ~50–56
@@ -180,19 +159,9 @@ lookup$distance_m <- distHaversine(
 
 result <- combinedriver %>% left_join(lookup, by = c("LAT", "LON"))
 
-# The moment of truth:
+#The moment of truth, these should show a small distance with 0 NAs
 summary(result$distance_m)
 sum(is.na(result$distance_m))   # should be 0
-
-#sanity checks
-result %>%
-  arrange(desc(distance_m)) %>%
-  select(LAT, LON, NGR_PREFIX, FNODE_LAT_seg, FNODE_LON_seg, distance_m) %>%
-  head(20)
-
-set.seed(1)
-plot_sample <- result[sample(nrow(result), 500), ]
-
 
 ##Match ID CREATION
 
@@ -299,17 +268,6 @@ head(result[, .(SAMPLE_ID, object_id, SAMPLE_DATE, temp_on_day, mean_temp)])
 sum(is.na(result$temp_on_day))
 sum(is.na(result$SAMPLE_DATE))
 
-#Sort to be statistically valid as the structure of result is entirely duplications
-#which would pseudoreplicate the response variable
-aspt_data <- result %>% distinct(SAMPLE_ID, .keep_all = TRUE)
-aspt_model_data <- aspt_data %>%
-  filter(!is.na(DISCHARGE)) %>%
-  mutate(
-    DISCHARGE = as.factor(DISCHARGE),
-    temp_z    = as.numeric(scale(temp_on_day)),
-    alk_z     = as.numeric(scale(ALKALINITY))
-  )
-
 #Filter out the EPT taxa from the taxoninfo and add them to result to prepare for 
 #taxa based modelling
 ept_taxa <- taxoninfo %>%
@@ -328,48 +286,36 @@ result <- result %>%
 #Check how many taxon records are EPT
 table(result$is_ept)
 
-# Map each taxon key to its EPT order
+#Map each taxon key to its EPT order
 order_lookup <- ept_taxa %>% distinct(TAXON_LIST_ITEM_KEY, ept_order)
 
-# Build per-sample presence/absence for each order
+#Build per-sample presence/absence for each order and create the final table 
 model_data <- result %>%
   left_join(order_lookup, by = "TAXON_LIST_ITEM_KEY") %>%
   group_by(SAMPLE_ID) %>%
   summarise(
-    SITE_ID      = first(SITE_ID),
-    SAMPLE_DATE  = first(SAMPLE_DATE),
-    temp_on_day  = first(temp_on_day),
-    ALKALINITY   = first(ALKALINITY),
-    DISCHARGE    = first(DISCHARGE),
+    SITE_ID       = first(SITE_ID),
+    SAMPLE_DATE   = first(SAMPLE_DATE),
+    temp_on_day   = first(temp_on_day),
+    ALKALINITY    = first(ALKALINITY),
+    DISCHARGE     = first(DISCHARGE),
+    WHPT_ASPT     = first(WHPT_ASPT),          
     Ephemeroptera = any(ept_order == "Ephemeroptera", na.rm = TRUE),
     Plecoptera    = any(ept_order == "Plecoptera",    na.rm = TRUE),
     Trichoptera   = any(ept_order == "Trichoptera",   na.rm = TRUE),
     .groups = "drop"
-  )
-model_data <- model_data %>%
+  ) %>%
   filter(!is.na(DISCHARGE)) %>%
-  mutate(
-   # DISCHARGE = as.factor(DISCHARGE),
-    temp_z    = as.numeric(scale(temp_on_day)),
-    alk_z     = as.numeric(scale(ALKALINITY))
-  )
+  mutate(DISCHARGE = as.factor(DISCHARGE))
+
+   
 #Check these are mayfly/stonefly/caddisfly families
 result %>% filter(is_ept) %>% distinct(TAXON_NAME) %>% head(20)
 
 #Extra: check that non-EPT looks right too
 result %>% filter(!is_ept) %>% distinct(TAXON_NAME) %>% head(20)
 
-#for table summaries
-#keep the columns that do NOT contain "_seg"
-keep_cols <- grep("_seg", names(aspt_model_data), invert = TRUE, value = TRUE)
-
-#New data.table with only those columns
-aspt_model_data_sum <- aspt_model_data[, ..keep_cols]
-aspt_model_sum<- as.data.table(summary(aspt_model_data_sum))
-
-#add in the year
-aspt_model_data <- aspt_model_data %>%
-  mutate(SAMPLE_YEAR = as.integer(format(SAMPLE_DATE, "%Y")))
+#Add in the year and convert the taxa columns to numeric
 
 model_data <- model_data %>%
   mutate(SAMPLE_YEAR = as.integer(format(SAMPLE_DATE, "%Y")))
@@ -379,18 +325,17 @@ model_data$Trichoptera<- as.numeric(model_data$Trichoptera)
 ##Finally, create the models
 
 #First model: WHPT score response - average score per taxon as the variable
-scoremodel<- lmer(WHPT_ASPT ~ temp_z + alk_z +(1|SITE_ID)+ (1|SAMPLE_YEAR) + SAMPLE_YEAR +
-               DISCHARGE + temp_z*alk_z, data=aspt_model_data)
+scoremodel<- lmerTest::lmer(WHPT_ASPT ~ temp_on_day + ALKALINITY +(1|SITE_ID)+ (1|SAMPLE_YEAR) +
+               DISCHARGE + temp_on_day*ALKALINITY, data=aspt_model_data)
 #Model of Ephemeroptera presence (mayflies)
-ephmodel<- glmer(Ephemeroptera ~ temp_z +alk_z +(1|SITE_ID)+DISCHARGE + (1|SAMPLE_YEAR)  +
-                   temp_z*alk_z, data = model_data, family=binomial)
+ephmodel<- glmer(Ephemeroptera ~ temp_on_day + ALKALINITY +(1|SITE_ID)+ (1|SAMPLE_YEAR) +
+                   as.factor(DISCHARGE) + temp_on_day*ALKALINITY, data = model_data, family=binomial)
 #Model for Trichoptera presence (caddisflies)
-trimodel<- glmer(Trichoptera ~ temp_z +alk_z +(1|SITE_ID)+DISCHARGE + (1|SAMPLE_YEAR)  +
-                   temp_z*alk_z, data = model_data, family=binomial)
+trimodel<- glmer(Trichoptera ~ temp_on_day + ALKALINITY +(1|SITE_ID)+ (1|SAMPLE_YEAR) +
+                   as.factor(DISCHARGE) + temp_on_day*ALKALINITY, data = model_data, family=binomial)
 #Model for Plecoptera presence (stoneflies)
-plemodel<- glmer(Plecoptera ~ temp_z +alk_z +(1|SITE_ID)+DISCHARGE + (1|SAMPLE_YEAR) +
-                   temp_z*alk_z, data = model_data, family=binomial)
-
+plemodel<- glmer(Plecoptera ~ temp_on_day + ALKALINITY +(1|SITE_ID)+ (1|SAMPLE_YEAR) +
+                   as.factor(DISCHARGE) + temp_on_day*ALKALINITY, data = model_data, family=binomial)
 #Print the model outputs
 summary(scoremodel)
 summary(ephmodel)
@@ -409,6 +354,10 @@ qqnorm(resid(scoremodel)); qqline(resid(scoremodel))
 
 ##Residuals for the binomial models
 #Ephemeroptera
+check_model(ephmodel)          # visual suite
+check_singularity(ephmodel)    # singular fit?
+icc(ephmodel)
+
 simE <- simulateResiduals(fittedModel = ephmodel)
 
 plot(simE)              # two diagnostic plots (QQ + residual vs predicted)
@@ -430,30 +379,36 @@ testDispersion(simP)    # formal dispersion test with p-value
 testZeroInflation(simP)      # presence/absence data often has zero-inflation
 
 #####Plots
+
 ##Score model plots
 #temp
-tempmod <- ggpredict(scoremodel, terms = "temp_z")
+tempmod <- ggpredict(scoremodel, terms = "temp_on_day")
 
-tempmod$x_real <- tempmod$x * sd(aspt_model_data$temp_on_day, na.rm = TRUE) +
-  mean(aspt_model_data$temp_on_day, na.rm = TRUE)
+#tempmod$x_real <- tempmod$x * sd(aspt_model_data$temp_on_day, na.rm = TRUE) +
+#  mean(aspt_model_data$temp_on_day, na.rm = TRUE)
 
-tempmodplot<- ggplot(tempmod, aes(x = x_real, y = predicted)) +
+tempmodplot<- ggplot(tempmod, aes(x = x, y = predicted)) +
+  geom_point(data=aspt_model_data, aes(x=temp_on_day, y=WHPT_ASPT), alpha =0.2, colour='grey')+  
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
-  labs(x = "Temperature (°C)", y = "Predicted ASPT") +
+  coord_cartesian(ylim = c(1, 10)) +
+  labs(x = "Temperature (°C)", y = "ASPT") +
   theme_minimal()
 tempmodplot
 
+
 #Alk
-alkmod <- ggpredict(scoremodel, terms = "alk_z")
+alkmod <- ggpredict(scoremodel, terms = "ALKALINITY")
 
-alkmod$x_real <- alkmod$x * sd(aspt_model_data$ALKALINITY, na.rm = TRUE) +
-  mean(aspt_model_data$ALKALINITY, na.rm = TRUE)
+#alkmod$x_real <- alkmod$x * sd(aspt_model_data$ALKALINITY, na.rm = TRUE) +
+#  mean(aspt_model_data$ALKALINITY, na.rm = TRUE)
 
-alkmodplot<- ggplot(alkmod, aes(x = x_real, y = predicted)) +
+alkmodplot<- ggplot(alkmod, aes(x = x, y = predicted)) +
+  geom_point(data=aspt_model_data, aes(x=ALKALINITY, y=WHPT_ASPT), alpha =0.2, colour='grey')+
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
-  labs(x = "Alkalinity", y = "Predicted ASPT") +
+  coord_cartesian(ylim = c(1, 10)) +
+  labs(x = "Alkalinity (mg/L CaCO3)", y = "ASPT") + 
   theme_minimal()
 alkmodplot
 
@@ -461,34 +416,67 @@ alkmodplot
 dismod <- ggpredict(scoremodel, terms = "DISCHARGE")
 
 dismodplot <- ggplot(dismod, aes(x = x, y = predicted)) +
-  geom_point(size = 2) +
+  geom_point(size=2)+
+  geom_point(data=aspt_model_data, aes(x=DISCHARGE, y=WHPT_ASPT), alpha =0.2, colour='grey')+
   geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
-  labs(x = "Discharge", y = "Predicted ASPT") +
+  coord_cartesian(ylim = c(1, 10)) +
+  labs(x = "Discharge", y = "ASPT") +
   theme_minimal()
 dismodplot
 
+intmod<- ggpredict(scoremodel, terms=c('temp_on_day', 'ALKALINITY'))
+intmod2<- ggpredict(scoremodel, terms=c('ALKALINITY', 'temp_on_day'))
+
+plot(intmod)
+plot(intmod2)
+intmodplot <- ggplot(intmod, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(size = 0.8) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+  coord_cartesian(ylim = c(1, 10)) +
+  labs(x = "Temperature (°C)", y = "ASPT",
+       colour = "Alkalinity",
+       fill = "Alkalinity") +
+  theme_minimal()
+intmodplot
+
+intmod2plot <- ggplot(intmod2, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(size = 0.8) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
+  coord_cartesian(ylim = c(1, 10)) +
+  labs(x = "Alkalinity (mg/L CaCO3)", y = "ASPT",
+       colour = "Temperature (°C)",
+       fill = "Temperature (°C)") +
+  theme_minimal()
+intmod2plot
+
+alkyearmod<- ggpredict(scoremodel, terms =c('SAMPLE_YEAR', 'ALKALINITY'))
+plot(alkyearmod)
 ##Ephemeroptera model plots
 #Temp
-Emod<- ggpredict(ephmodel, terms = 'temp_z')
-Emod$x_real <- Emod$x * sd(model_data$temp_on_day, na.rm = TRUE) +
-  mean(model_data$temp_on_day, na.rm = TRUE)
+Emod<- ggpredict(ephmodel, terms = 'temp_on_day')
 
-Emodplot<- ggplot(Emod, aes(x = x_real, y = predicted)) +
+#Emod$x_real <- Emod$x * sd(model_data$temp_on_day, na.rm = TRUE) +
+ # mean(model_data$temp_on_day, na.rm = TRUE)
+
+Emodplot<- ggplot(Emod, aes(x = x, y = predicted)) +
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
+  coord_cartesian(ylim = c(0, 1)) +
   labs(x = "Temperature (°C)", y = "Ephemeroptera") +
   theme_minimal()
 Emodplot
 
 #Alk
-EmodA<- ggpredict(ephmodel, terms = 'alk_z')
-EmodA$x_real <- EmodA$x * sd(model_data$ALKALINITY, na.rm = TRUE) +
-  mean(model_data$ALKALINITY, na.rm = TRUE)
+EmodA<- ggpredict(ephmodel, terms = 'ALKALINITY')
 
-EmodAplot<- ggplot(EmodA, aes(x = x_real, y = predicted)) +
+#EmodA$x_real <- EmodA$x * sd(model_data$ALKALINITY, na.rm = TRUE) +
+ # mean(model_data$ALKALINITY, na.rm = TRUE)
+
+EmodAplot<- ggplot(EmodA, aes(x = x, y = predicted)) +
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
-  labs(x = "Alkalinity", y = "Ephemeroptera") +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "Alkalinity (mg/L CaCO3)", y = "Ephemeroptera") +
   theme_minimal()
 EmodAplot
 
@@ -496,33 +484,36 @@ EmodAplot
 EmodD <- ggpredict(ephmodel, terms = "DISCHARGE")
 
 EmodDplot<- ggplot(EmodD, aes(x = x, y = predicted)) +
-  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
-  geom_line() +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  coord_cartesian(ylim = c(0, 1)) +
   labs(x = "Discharge", y = "Ephemeroptera") +
   theme_minimal()
 EmodDplot
 
 ##Trichoptera model plot
-Tmod<- ggpredict(trimodel, terms = 'temp_z')
-Tmod$x_real <- Tmod$x * sd(model_data$temp_on_day, na.rm = TRUE) +
-  mean(model_data$temp_on_day, na.rm = TRUE)
+Tmod<- ggpredict(trimodel, terms = 'temp_on_day')
+#Tmod$x_real <- Tmod$x * sd(model_data$temp_on_day, na.rm = TRUE) +
+ # mean(model_data$temp_on_day, na.rm = TRUE)
 
-Tmodplot<- ggplot(Tmod, aes(x = x_real, y = predicted)) +
+Tmodplot<- ggplot(Tmod, aes(x = x, y = predicted)) +
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
+  coord_cartesian(ylim = c(0, 1)) +
   labs(x = "Temperature (°C)", y = "Trichoptera") +
   theme_minimal()
 Tmodplot
 
 #Alkalinity
-TmodA<- ggpredict(trimodel, terms = 'alk_z')
-TmodA$x_real <- TmodA$x * sd(model_data$ALKALINITY, na.rm = TRUE) +
-  mean(model_data$ALKALINITY, na.rm = TRUE)
+TmodA<- ggpredict(trimodel, terms = 'ALKALINITY')
+#TmodA$x_real <- TmodA$x * sd(model_data$ALKALINITY, na.rm = TRUE) +
+ # mean(model_data$ALKALINITY, na.rm = TRUE)
 
-TmodAplot<- ggplot(TmodA, aes(x = x_real, y = predicted)) +
+TmodAplot<- ggplot(TmodA, aes(x = x, y = predicted)) +
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
-  labs(x = "Alkalinity", y = "Trichoptera") +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "Alkalinity (mg/L CaCO3)", y = "Trichoptera") +
   theme_minimal()
 TmodAplot
 
@@ -530,33 +521,37 @@ TmodAplot
 TmodD <- ggpredict(trimodel, terms = "DISCHARGE")
 
 TmodDplot<- ggplot(TmodD, aes(x = x, y = predicted)) +
-  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
-  geom_line() +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  coord_cartesian(ylim = c(0, 1)) +
   labs(x = "Discharge", y = "Trichoptera") +
   theme_minimal()
 TmodDplot
+
 ##Plecoptera model plots
 #Temp
-Pmod<- ggpredict(plemodel, terms = 'temp_z')
-Pmod$x_real <- Pmod$x * sd(model_data$temp_on_day, na.rm = TRUE) +
-  mean(model_data$temp_on_day, na.rm = TRUE)
+Pmod<- ggpredict(plemodel, terms = 'temp_on_day')
+#Pmod$x_real <- Pmod$x * sd(model_data$temp_on_day, na.rm = TRUE) +
+ # mean(model_data$temp_on_day, na.rm = TRUE)
 
-Pmodplot<- ggplot(Pmod, aes(x = x_real, y = predicted)) +
+Pmodplot<- ggplot(Pmod, aes(x = x, y = predicted)) +
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
+  coord_cartesian(ylim = c(0, 1)) +
   labs(x = "Temperature (°C)", y = "Plecoptera") +
   theme_minimal()
 Pmodplot
 
 #Alkalinity
-PmodA<- ggpredict(plemodel, terms = 'alk_z')
-PmodA$x_real <- PmodA$x * sd(model_data$ALKALINITY, na.rm = TRUE) +
-  mean(model_data$ALKALINITY, na.rm = TRUE)
+PmodA<- ggpredict(plemodel, terms = 'ALKALINITY')
+#PmodA$x_real <- PmodA$x * sd(model_data$ALKALINITY, na.rm = TRUE) +
+ # mean(model_data$ALKALINITY, na.rm = TRUE)
 
-PmodAplot<- ggplot(PmodA, aes(x = x_real, y = predicted)) +
+PmodAplot<- ggplot(PmodA, aes(x = x, y = predicted)) +
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
   geom_line() +
-  labs(x = "Alkalinity", y = "Plecoptera") +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "Alkalinity (mg/L CaCO3)", y = "Plecoptera") +
   theme_minimal()
 PmodAplot
 
@@ -564,85 +559,30 @@ PmodAplot
 PmodD <- ggpredict(plemodel, terms = "DISCHARGE")
 
 PmodDplot<- ggplot(PmodD, aes(x = x, y = predicted)) +
-  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2) +
-  geom_line() +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  coord_cartesian(ylim = c(0, 1)) +
   labs(x = "Discharge", y = "Plecoptera") +
   theme_minimal()
 PmodDplot
 
 ##Combo plots
-(Emodplot + Tmodplot + Pmodplot) + plot_annotation(title = "Predicted probability of taxa presence against Temperature",
+(Emodplot + Pmodplot + Tmodplot) + plot_annotation(title = "Figure 4: Probability of Taxa Presence against Temperature",
                                                    tag_levels = "A")
 
-(EmodAplot + TmodAplot + PmodAplot) + plot_annotation(title = "Predicted probability Taxa presence against Alkalinity",
+(EmodAplot + PmodAplot + TmodAplot) + plot_annotation(title = "Figure 5: Probability of Taxa presence against Alkalinity",
                                                    tag_levels = "A") 
 
-(EmodDplot + TmodDplot + PmodDplot) + plot_annotation(title = "Predicted probability Taxa presence against Discharge",
+(EmodDplot + PmodDplot + TmodDplot) + plot_annotation(title = "Figure 6: Probability of Taxa presence against Discharge",
                                                       tag_levels = "A") 
 
-(tempmodplot + alkmodplot + dismodplot) + plot_annotation(title = "Predicted ASPT against predictors",
+(tempmodplot + alkmodplot + dismodplot) + plot_annotation(title = "Figure 2: ASPT against Variables",
                                            tag_levels = "A") 
 
-yearscore<- ggplot(aspt_model_data, aes(x=SAMPLE_YEAR, y=WHPT_ASPT)) +geom_point()+
-  labs(x='Sample Year', y='ASPT')
-yearscore
+(intmodplot + intmod2plot) + plot_annotation(title = "Figure 3: ASPT and interaction term",
+                                           tag_levels = "A")
 
-tempyear<- ggplot(aspt_model_data, aes(x=SAMPLE_YEAR, y=temp_on_day)) +geom_point()+
-  labs(x='Sample Year', y='Temperature on sample day (°C)')
-tempyear
-
-ephtemp<- ggplot(model_data, aes(x=as.factor(Ephemeroptera), y=temp_on_day))+ geom_point()+
-  labs(x='Ephemeroptera presence', y='Temperature (°C)')
-ephtemp
-
-ephalk<- ggplot(model_data, aes(x=as.factor(Ephemeroptera), y=ALKALINITY))+ geom_violin()+
-  labs(x='Ephemeroptera presence', y='Alkalinity')
-ephalk
-
-tritemp<- ggplot(model_data, aes(x=as.factor(Trichoptera), y=temp_on_day))+ geom_point()+
-  labs(x='Trichopter presence', y='Temperature (°C)')
-tritemp
-
-pletemp<- ggplot(model_data, aes(x=as.factor(Ephemeroptera), y=temp_on_day))+ geom_point()+
-  labs(x='Ephemeroptera presence', y='Temperature (°C)')
-pletemp
-
-tempalk<- ggplot(aspt_model_data, aes(x=alk_z, y=temp_z)) + geom_point()
-tempalk
-
-bmwpwhpt<- ggplot(aspt_model_data, aes(x=BMWP_ASPT, y=WHPT_ASPT)) + geom_point() +geom_smooth()+
-  labs(x='BMWP ASPT', y='WHPT ASPT')
-bmwpwhpt
-
-dischscore<- ggplot(aspt_model_data, aes(x=as.factor(DISCHARGE), y=WHPT_ASPT)) + geom_boxplot()+
-  geom_hline(yintercept = mean(aspt_model_data$WHPT_ASPT, na.rm = TRUE),
-             colour = "blue", linewidth = 1)+
-  labs(x='Discharge', y='ASPT')
-dischscore
-
-long_data <- model_data %>%
-  pivot_longer(cols = c(Ephemeroptera, Trichoptera, Plecoptera),
-               names_to = "taxon",
-               values_to = "present") %>%
-  filter(present == TRUE)          # keep only where the taxon was recorded
-
-grouptaxtemp<- ggplot(long_data, aes(x = taxon, y = temp_on_day)) +
-  geom_boxplot()+
-  labs(x='Order',y='Temperature (°C)' )
-grouptaxtemp
-
-grouptaxalk<- ggplot(long_data, aes(x=taxon, y=ALKALINITY)) + geom_boxplot()+
-  labs(x='Order', y='Alkalinity')
-grouptaxalk
-# data.table — replace mean_temp_col with your actual column name
-site_means <- result[, .(site_mean_temp = mean(mean_temp, na.rm = TRUE)),
-                     by = SITE_ID]
-
-sitetemp<- ggplot(site_means, aes(x = SITE_ID, y = site_mean_temp)) +
-  geom_point() +
-  labs(x = "Site", y = "Mean temperature (°C)")
-sitetemp
-
+#Coordinate plot
 matchcoordplot <- ggplot() +
   geom_segment(data = plot_sample,
                aes(x = LON, y = LAT,
@@ -656,8 +596,7 @@ matchcoordplot <- ggplot() +
   scale_colour_manual(name = "Location",
                       values = c("River coordinate" = "blue", "Temperature coordinate" = "red")) +
   coord_quickmap() +
+  labs(x='Longitude', y='Latitude', title='Figure 1: Coordinate Map')+
   theme_minimal()
 matchcoordplot
 
-taxaNaspt<- ggplot(aspt_model_data, aes(x=WHPT_N_TAXA, y=WHPT_ASPT)) +geom_point() 
-taxaNaspt
